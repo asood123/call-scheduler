@@ -56,9 +56,9 @@ class Slot():
 
     def __str__(self):
         if self.type == SLOT_TYPE_WEEKDAY:
-            return 'Weekday: {0} assigned to {1}'.format(self.start_date.strftime('%m/%d/%Y'), self.assigned_to.name)
+            return 'Weekday: {0} assigned to {1}'.format(self.start_date.strftime('%a %m/%d/%Y'), self.assigned_to.name)
         else:
-            return 'Weekend: {0} - {1} assigned to {2}'.format(self.start_date.strftime('%m/%d/%Y'), self.end_date.strftime('%m/%d/%Y'), self.assigned_to.name)
+            return 'Weekend: {0} - {1} assigned to {2}'.format(self.start_date.strftime('%a %m/%d/%Y'), self.end_date.strftime('%a %m/%d/%Y'), self.assigned_to.name)
 
     @staticmethod
     def generate_stats(slots):
@@ -105,7 +105,8 @@ class Person:
             SLOT_TYPE_WEEKDAY: 0,
             SLOT_TYPE_WEEKEND: 0
         }
-        self.last_date_assigned = INITIAL_LAST_DATE_ASSIGNED
+        self.last_any_date_assigned = INITIAL_LAST_DATE_ASSIGNED
+        self.last_weekend_assigned = INITIAL_LAST_DATE_ASSIGNED
 
     def is_available(self, proposed_dates):
         # todo: can improve algorithm
@@ -123,30 +124,62 @@ class Person:
         slot_type = slot.type
         # update stats
         self.stats[slot_type] += 1
+
         # update last_assigned_date
-        self.last_date_assigned = slot.end_date
+        self.last_any_date_assigned = slot.end_date
+        if slot.type == SLOT_TYPE_WEEKEND:
+            self.last_weekend_assigned = slot.end_date
 
     def __str__(self):
         max_weekends = self.max_slots[SLOT_TYPE_WEEKEND]
+        max_weekdays = self.max_slots[SLOT_TYPE_WEEKDAY]
         if max_weekends == MAX_SLOTS:
             max_weekends = '-'
-        return '{0: <20} | Day blocked off: {1: <2}, Assigned: {2} weekends, {3} weekdays | Max weekends: {4}'.format(
-            self.name, len(self.blocked_dates), self.stats[SLOT_TYPE_WEEKEND], self.stats[SLOT_TYPE_WEEKDAY], max_weekends)
+        if max_weekdays == MAX_SLOTS:
+            max_weekdays = '_'
+        return '{0: <20} | Day blocked off: {1: <2}, Assigned: {2} weekends, {3} weekdays | Max weekends: {4}, Max weekdays: {5}'.format(
+            self.name, len(self.blocked_dates), self.stats[SLOT_TYPE_WEEKEND], self.stats[SLOT_TYPE_WEEKDAY], max_weekends, max_weekdays)
 
     @staticmethod
-    def sort_by_least_busy_person(persons_list, slot_to_be_filled):
+    def find_next_best_person(persons_list, slot_to_be_filled):
         slot_type = slot_to_be_filled.type
+        available = []
 
-        # remove anyone who has hit their max weekends
-        available = filter(lambda person: person.max_slots[slot_type] >
-                           person.stats[slot_type], persons_list)
-        # remove anyone who has this date blocked
-        available = filter(lambda person: person.is_available(date_range_to_list(
-            slot_to_be_filled.start_date, slot_to_be_filled.end_date)), available)
-        # return sorted list by count and then last picked
+        # Tried to chain filter calls but didn't work?
+        for person in persons_list:
+            # skip anyone who has hit their max of a type of slot
+            if person.max_slots[slot_type] <= person.stats[slot_type]:
+                continue
 
-        return sorted(available, key=lambda person: (person.stats[slot_type], person.last_date_assigned))
+            # skip anyone who has this date blocked off
+            if not person.is_available(date_range_to_list(
+                    slot_to_be_filled.start_date, slot_to_be_filled.end_date)):
+                continue
 
+            # for weekend_slots, skip anyone who has had a weekend call in last 14 days
+            if slot_type == SLOT_TYPE_WEEKEND:
+                days_since_last_weekend_call = (
+                    slot_to_be_filled.start_date - person.last_weekend_assigned).days
+                if days_since_last_weekend_call < 14:
+                    continue
+
+            # for weekday slots, skip anyone who was on call in last 3 days.
+            if slot_type == SLOT_TYPE_WEEKDAY:
+                days_since_last_weekday_call = (
+                    slot_to_be_filled.start_date - person.last_any_date_assigned).days
+                if days_since_last_weekday_call < 3:
+                    continue
+            available.append(person)
+
+        # sort the list by least of this slot_type and by last_any_date_assigned
+        sorted_availability = list(sorted(available, key=lambda person: (
+            person.stats[slot_type], person.last_any_date_assigned)))
+
+        if len(sorted_availability) == 0:
+            print("Error")
+            raise Exception("No one found for slot: ", slot_to_be_filled)
+        else:
+            return sorted_availability[0]
 
 ##################
 
@@ -160,7 +193,7 @@ def read_csv(filename):
         file_reader = csv.reader(csvfile, delimiter=',')
         for index, row in enumerate(file_reader):
             if (index == 0 or row[0] == ''):
-                # header row, skip
+                    # header row, skip
                 continue
 
             # parse row
@@ -190,9 +223,13 @@ def read_csv(filename):
                 person.add_blocked_dates(start_date, end_date)
             if type_row == 'holiday':
                 date_range = date_range_to_list(start_date, end_date)
+                # TODO: add as a slot that's a holiday
+                #       process it later and use it for "last_day_assigned"
                 skipped_slots_list.update(date_range)
             if type_row == 'max_weekends':
                 person.max_slots[SLOT_TYPE_WEEKEND] = int(row[4])
+            if type_row == 'max_weekdays':
+                person.max_slots[SLOT_TYPE_WEEKDAY] = int(row[4])
 
     print('Skipped days: {0}'.format(len(skipped_slots_list)))
 
@@ -234,17 +271,14 @@ def create_schedule(persons_list, slot_list):
     # start filling slots
 
     for slot in slot_list:
-        priority_person_list = Person.sort_by_least_busy_person(
+        next_person = Person.find_next_best_person(
             persons_list, slot)
-        if len(priority_person_list) == 0:
-            print("Error")
-            raise Exception("No one found for ", slot)
 
         # Schedule slot
-        slot.assigned_to = priority_person_list[0]
+        slot.assigned_to = next_person
 
         # update stats
-        priority_person_list[0].assign_slot(slot)
+        next_person.assign_slot(slot)
 
 
 def print_schedule(slots):
